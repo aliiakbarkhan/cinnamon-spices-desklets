@@ -1,13 +1,12 @@
 const Desklet = imports.ui.desklet;
 const St = imports.gi.St;
-const Lang = imports.lang;
 const Mainloop = imports.mainloop;
 const GLib = imports.gi.GLib;
+const Gio = imports.gi.Gio;
 const Meta = imports.gi.Meta;
 const Settings = imports.ui.settings;
 
-const UUID = "screentime@local";
-const DATA_FILE = GLib.get_home_dir() + "/.cache/screentime-desklet.json";
+const UUID = "screentime@aliiakbarkhan";
 const CHECK_INTERVAL_SECONDS = 5;
 
 function _todayStr() {
@@ -42,15 +41,19 @@ MyDesklet.prototype = {
 
         // Settings
         this.settings = new Settings.DeskletSettings(this, UUID, desklet_id);
-        this.settings.bind("idle-threshold", "idleThreshold", this._onSettingsChanged);
-        this.settings.bind("show-seconds", "showSeconds", this._onSettingsChanged);
-        this.settings.bind("font-size", "fontSize", this._onSettingsChanged);
+        this.settings.bind("idle-threshold", "idleThreshold", () => this._onSettingsChanged());
+        this.settings.bind("show-seconds", "showSeconds", () => this._onSettingsChanged());
+        this.settings.bind("font-size", "fontSize", () => this._onSettingsChanged());
 
         // State
         this.activeSeconds = 0;
         this.currentDate = _todayStr();
 
-        this._loadData();
+        // Use the proper XDG cache dir instead of hardcoding ~/.cache
+        let cacheDir = GLib.get_user_cache_dir();
+        GLib.mkdir_with_parents(cacheDir, 0o755);
+        this._dataFilePath = GLib.build_filenamev([cacheDir, "screentime-desklet.json"]);
+        this._dataFile = Gio.File.new_for_path(this._dataFilePath);
 
         // UI
         this._label = new St.Label({ style_class: "screentime-label" });
@@ -62,10 +65,14 @@ MyDesklet.prototype = {
         this._idleMonitor = Meta.IdleMonitor.get_core();
         this._lastCheck = GLib.get_monotonic_time();
 
-        this._timeoutId = Mainloop.timeout_add_seconds(
-            CHECK_INTERVAL_SECONDS,
-            Lang.bind(this, this._tick)
-        );
+        // Load saved data asynchronously so we never block the main loop,
+        // then start the periodic tick once it's ready.
+        this._loadData(() => {
+            this._timeoutId = Mainloop.timeout_add_seconds(
+                CHECK_INTERVAL_SECONDS,
+                () => this._tick()
+            );
+        });
     },
 
     _onSettingsChanged: function () {
@@ -77,30 +84,30 @@ MyDesklet.prototype = {
         this._label.style = "font-size: " + (this.fontSize || 16) + "px;";
     },
 
-    _loadData: function () {
-        try {
-            if (GLib.file_test(DATA_FILE, GLib.FileTest.EXISTS)) {
-                let [ok, contents] = GLib.file_get_contents(DATA_FILE);
-                if (ok) {
-                    let text = imports.byteArray
-                        ? imports.byteArray.toString(contents)
-                        : contents.toString();
-                    let data = JSON.parse(text);
-                    if (data.date === _todayStr()) {
-                        this.activeSeconds = data.activeSeconds || 0;
-                        this.currentDate = data.date;
-                    } else {
-                        // Stale data from a previous day: start fresh
-                        this.activeSeconds = 0;
-                        this.currentDate = _todayStr();
-                    }
+    _loadData: function (callback) {
+        this._dataFile.load_contents_async(null, (file, res) => {
+            try {
+                let [, contents] = file.load_contents_finish(res);
+                let text = imports.byteArray
+                    ? imports.byteArray.toString(contents)
+                    : contents.toString();
+                let data = JSON.parse(text);
+                if (data.date === _todayStr()) {
+                    this.activeSeconds = data.activeSeconds || 0;
+                    this.currentDate = data.date;
+                } else {
+                    // Stale data from a previous day: start fresh
+                    this.activeSeconds = 0;
+                    this.currentDate = _todayStr();
                 }
+            } catch (e) {
+                // No existing data file yet (first run) or it's unreadable - start fresh
+                this.activeSeconds = 0;
+                this.currentDate = _todayStr();
             }
-        } catch (e) {
-            global.logError("screentime desklet: failed to load data - " + e);
-            this.activeSeconds = 0;
-            this.currentDate = _todayStr();
-        }
+            this._updateLabel();
+            if (callback) callback();
+        });
     },
 
     _saveData: function () {
@@ -109,7 +116,7 @@ MyDesklet.prototype = {
                 date: this.currentDate,
                 activeSeconds: Math.floor(this.activeSeconds),
             });
-            GLib.file_set_contents(DATA_FILE, data);
+            GLib.file_set_contents(this._dataFilePath, data);
         } catch (e) {
             global.logError("screentime desklet: failed to save data - " + e);
         }
